@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from decimal import Decimal
 
 from aiogram import Bot, F, Router
@@ -25,6 +26,8 @@ from services import voting_service
 from utils.formatting import format_money
 from utils.phone import normalize_uz_phone
 from utils.timezone import format_local
+
+logger = logging.getLogger("openbudget")
 
 router = Router(name="user_voting")
 
@@ -163,7 +166,7 @@ async def screenshot_added(
             existing_task = _pending_finalize.pop(user_id, None)
             if existing_task is not None:
                 existing_task.cancel()
-            await _finalize_submission(session, state, bot, db_user)
+            await _finalize_and_handle_errors(session, state, bot, db_user, own_session=False)
             return
 
         # part of an album — more parts may still be arriving; (re)schedule the debounce
@@ -184,8 +187,37 @@ async def _finalize_after_delay(user_id: int, state: FSMContext, bot: Bot, db_us
     async with _get_lock(user_id):
         _pending_finalize.pop(user_id, None)
         async with async_session_factory() as session:
-            await _finalize_submission(session, state, bot, db_user)
+            await _finalize_and_handle_errors(session, state, bot, db_user, own_session=True)
+
+
+async def _finalize_and_handle_errors(
+    session: AsyncSession, state: FSMContext, bot: Bot, db_user: User, *, own_session: bool
+) -> None:
+    """Runs the finalize step and guarantees the user gets *some* response.
+
+    Without this, a failure partway through (e.g. a transient Telegram API error while
+    forwarding/posting) would either silently vanish (background album task) or leave a
+    half-submitted vote row committed with nothing posted to the channel. On any failure
+    we roll back so the vote is never left in that orphaned state, and the user's phone
+    number stays free to retry.
+    """
+    try:
+        await _finalize_submission(session, state, bot, db_user)
+        if own_session:
             await session.commit()
+    except Exception:
+        logger.exception("Ovoz arizasini yakunlashda xatolik (user_id=%s)", db_user.telegram_id)
+        await session.rollback()
+        await state.clear()
+        try:
+            await bot.send_message(
+                db_user.telegram_id,
+                "⚠️ Arizangizni yuborishda xatolik yuz berdi. "
+                "Iltimos, \"📮 Ovoz berish\" orqali qaytadan urinib ko'ring.",
+                reply_markup=main_menu(),
+            )
+        except Exception:  # noqa: BLE001 - best-effort notification only
+            pass
 
 
 async def _finalize_submission(
@@ -199,6 +231,13 @@ async def _finalize_submission(
     if not screenshot_ids or project_id is None or phone_number is None:
         # nothing to finalize — a stray/duplicate call after the flow already completed
         return
+
+    # forward_messages requires strictly increasing message ids; concurrent task
+    # scheduling doesn't guarantee photos are appended in arrival order, so sort them
+    # (message_id is monotonically increasing per chat, so this is always correct)
+    screenshot_message_ids, screenshot_ids = (
+        list(seq) for seq in zip(*sorted(zip(screenshot_message_ids, screenshot_ids)))
+    )
 
     project = await project_repo.get_active_project(session)
     if project is None or project.id != project_id:
