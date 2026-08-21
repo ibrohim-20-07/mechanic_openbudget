@@ -137,8 +137,7 @@ async def vote_done(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(screenshot_ids=[], screenshot_message_ids=[])
     await state.set_state(VotingStates.waiting_screenshot)
     await callback.message.answer(
-        "📸 Endi ovoz berganingizni tasdiqlovchi skrinshot(lar)ni yuboring "
-        "(bitta yoki bir nechtasini birga tanlab yuborsangiz ham bo'ladi)."
+        "📸 Endi ovoz berganingizni tasdiqlovchi skrinshotlarni yuboring."
     )
 
 
